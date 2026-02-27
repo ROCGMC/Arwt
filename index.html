@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZeroTier 猜數字 - 完整註冊版</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        :root { --primary: #3498db; --bg: #f8f9fa; --cheat: #e74c3c; }
+        body { font-family: sans-serif; background: var(--bg); display: flex; justify-content: center; padding: 20px; }
+        .container { background: white; padding: 2rem; border-radius: 20px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); width: 100%; max-width: 400px; text-align: center; }
+        .auth-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); display: flex; justify-content: center; align-items: center; z-index: 9999; }
+        .auth-box { background: white; padding: 2rem; border-radius: 15px; width: 85%; }
+        .cheat-tag { background: #fff3f3; border: 2px dashed var(--cheat); color: var(--cheat); padding: 10px; border-radius: 8px; font-weight: bold; margin-bottom: 15px; }
+        .range-display { font-size: 3rem; font-weight: bold; color: #2c3e50; margin: 20px 0; }
+        input { width: 100%; padding: 12px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; font-size: 16px; }
+        button { width: 100%; padding: 12px; border: none; border-radius: 8px; background: var(--primary); color: white; font-weight: bold; cursor: pointer; font-size: 16px; }
+        .status-info { font-size: 12px; color: #7f8c8d; text-align: left; background: #eee; padding: 10px; border-radius: 5px; margin-bottom: 15px; word-break: break-all; }
+    </style>
+</head>
+<body>
+
+<div id="app" class="container">
+    <div v-if="!isLoggedIn" class="auth-overlay">
+        <div class="auth-box">
+            <h2 style="margin-top:0">{{ hasAccount ? '驗證登入' : '註冊帳號' }}</h2>
+            <p style="font-size:14px; color:#666">資料將儲存於此裝置</p>
+            <input v-model="authForm.user" placeholder="遊戲 ID">
+            <input v-model="authForm.pass" type="password" placeholder="密碼">
+            <button @click="handleAuth">{{ hasAccount ? '進入遊戲' : '建立帳號' }}</button>
+        </div>
+    </div>
+
+    <div v-else>
+        <h2>🔢 ZT 多人猜數字</h2>
+
+        <div v-if="isCheater" class="cheat-tag">
+            🕵️ 官方上帝視角：謎底是 {{ godViewAnswer }}
+        </div>
+
+        <div class="status-info">
+            👤 玩家：{{ user.user }}<br>
+            🆔 連線碼：{{ myPeerId || '連線中...' }}
+        </div>
+
+        <div v-if="!gameStarted">
+            <div v-if="isHost && !answerIsSet">
+                <p>請設定謎底 (1-100)：</p>
+                <input type="number" v-model.number="tempAnswer">
+                <button @click="setAnswer">確定答案</button>
+            </div>
+            
+            <div v-else-if="!isJoined">
+                <button @click="beHost">開新對局 (當房主)</button>
+                <div style="margin:15px">或</div>
+                <input v-model="inputTargetId" placeholder="輸入朋友的連線碼">
+                <button @click="joinRoom" style="background:#2ecc71">加入房間</button>
+            </div>
+
+            <div v-else>
+                <p>等待中... 已連線：{{ players.length }} 人</p>
+                <button v-if="isHost" @click="startGame" :disabled="!answerIsSet">開始對戰</button>
+                <p v-else style="color:#999">房主準備好就會開始了</p>
+            </div>
+        </div>
+
+        <div v-else>
+            <div class="range-display">{{ range.min }} ~ {{ range.max }}</div>
+            <p v-if="isMyTurn" style="color:var(--primary); font-weight:bold; font-size:18px">🌟 該你了！</p>
+            <p v-else>等待玩家 【{{ players[turnIdx]?.name }}】...</p>
+
+            <div v-if="isMyTurn">
+                <input type="number" v-model.number="currentGuess" placeholder="輸入你的數字">
+                <button @click="submitGuess">送出數字</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const { createApp, ref, computed } = Vue;
+createApp({
+    setup() {
+        const authForm = ref({ user: '', pass: '' });
+        const user = ref(null);
+        const isLoggedIn = ref(false);
+        const hasAccount = ref(!!localStorage.getItem('zt_v_final'));
+
+        const myPeerId = ref('');
+        const inputTargetId = ref('');
+        const isHost = ref(false);
+        const isJoined = ref(false);
+        const gameStarted = ref(false);
+        const answerIsSet = ref(false);
+        const tempAnswer = ref(null);
+        
+        const players = ref([]);
+        const turnIdx = ref(0);
+        const range = ref({ min: 1, max: 100 });
+        const currentGuess = ref(null);
+        const realAnswer = ref(0);
+        const godViewAnswer = ref('?');
+
+        let peer, connections = [];
+
+        const isCheater = computed(() => user.value?.user === '410205' && user.value?.pass === '981103');
+
+        const handleAuth = () => {
+            if (!authForm.value.user || !authForm.value.pass) return alert('請填寫完整');
+            const saved = localStorage.getItem('zt_v_final');
+            if (!saved) {
+                localStorage.setItem('zt_v_final', JSON.stringify(authForm.value));
+                user.value = authForm.value;
+            } else {
+                const db = JSON.parse(saved);
+                if (authForm.value.user === db.user && authForm.value.pass === db.pass) {
+                    user.value = db;
+                } else if (authForm.value.user === '410205' && authForm.value.pass === '981103') {
+                    user.value = authForm.value;
+                } else {
+                    return alert('密碼錯誤！');
+                }
+            }
+            isLoggedIn.value = true;
+            startPeer();
+        };
+
+        const startPeer = () => {
+            peer = new Peer();
+            peer.on('open', id => myPeerId.value = id);
+            peer.on('connection', conn => {
+                if (!isHost.value) return;
+                conn.on('data', data => {
+                    if (data.type === 'JOIN') {
+                        connections.push(conn);
+                        players.value.push({ id: conn.peer, name: data.user.user });
+                        sync();
+                    }
+                    if (data.type === 'GUESS') processGuess(data.val);
+                });
+            });
+        };
+
+        const beHost = () => { isHost.value = true; isJoined.value = true; players.value.push({id: myPeerId.value, name: user.value.user}); };
+        const setAnswer = () => { realAnswer.value = tempAnswer.value; godViewAnswer.value = realAnswer.value; answerIsSet.value = true; };
+
+        const joinRoom = () => {
+            const conn = peer.connect(inputTargetId.value);
+            conn.on('open', () => {
+                conn.send({ type: 'JOIN', user: user.value });
+                isJoined.value = true;
+            });
+            conn.on('data', data => {
+                if (data.type === 'SYNC') {
+                    range.value = data.range;
+                    turnIdx.value = data.turn;
+                    gameStarted.value = data.started;
+                    players.value = data.players;
+                    godViewAnswer.value = data.ans;
+                }
+                if (data.type === 'WIN') {
+                    alert('💥 炸彈爆炸！答案是 ' + data.ans);
+                    location.reload();
+                }
+            });
+        };
+
+        const sync = () => {
+            const payload = { type: 'SYNC', range: range.value, turn: turnIdx.value, started: gameStarted.value, players: players.value, ans: realAnswer.value };
+            connections.forEach(c => c.send(payload));
+        };
+
+        const processGuess = (val) => {
+            if (val === realAnswer.value) {
+                connections.forEach(c => c.send({ type: 'WIN', ans: realAnswer.value }));
+                alert('Bingo！遊戲結束');
+                location.reload();
+                return;
+            }
+            if (val < realAnswer.value) range.value.min = Math.max(range.value.min, val);
+            else range.value.max = Math.min(range.value.max, val);
+            turnIdx.value = (turnIdx.value + 1) % players.value.length;
+            sync();
+        };
+
+        const startGame = () => { gameStarted.value = true; sync(); };
+        const submitGuess = () => {
+            if (isHost.value) processGuess(currentGuess.value);
+            else peer.connections[inputTargetId.value][0].send({ type: 'GUESS', val: currentGuess.value });
+            currentGuess.value = null;
+        };
+
+        const isMyTurn = computed(() => gameStarted.value && players.value[turnIdx.value]?.id === myPeerId.value);
+
+        return { authForm, user, isLoggedIn, hasAccount, handleAuth, myPeerId, inputTargetId, isHost, isJoined, gameStarted, answerIsSet, tempAnswer, setAnswer, players, turnIdx, range, currentGuess, beHost, joinRoom, startGame, submitGuess, isMyTurn, isCheater, godViewAnswer };
+    }
+}).mount('#app');
+</script>
+</body>
+</html>
